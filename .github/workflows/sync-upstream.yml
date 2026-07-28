@@ -10,7 +10,8 @@ name: Sync upstream-main
 
 on:
   schedule:
-    - cron: "17 4 * * *"
+    # Monthly: upstream moves rarely, and this fork does not build from it.
+    - cron: "17 4 1 * *"
   workflow_dispatch:
 
 permissions:
