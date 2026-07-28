@@ -4,6 +4,10 @@
 
 # VideoWatcher
 
+> A fork of [jordanrendric/claude-video-vision](https://github.com/jordanrendric/claude-video-vision),
+> rewritten in 2.0 around a single dependency-free local backend. The 1.x history — and most of the
+> commits behind it — is upstream's.
+
 MCP plugin for Claude Code that lets Claude **watch local video files**: it extracts frames and transcribes audio entirely inside the Node process — no external system binary, and no network calls at runtime beyond a one-time whisper model download on first use.
 
 ## How it works
