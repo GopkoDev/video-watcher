@@ -1,0 +1,41 @@
+name: Sync upstream-main
+
+# Keeps the `upstream-main` branch an exact mirror of the parent repository's
+# `main`. Nothing in this repository builds from it — it exists so upstream
+# changes can be diffed and cherry-picked without adding a remote by hand.
+#
+# Note: GitHub disables scheduled workflows on forks until they are enabled
+# once in the Actions tab, and pauses them again after 60 days without any
+# repository activity.
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      # A bare clone of upstream rather than actions/checkout: the checkout is
+      # shallow by default, and pushing from a shallow repository is rejected.
+      - name: Mirror jordanrendric/claude-video-vision@main into upstream-main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git clone --bare --single-branch --branch main \
+            https://github.com/jordanrendric/claude-video-vision.git upstream.git
+          cd upstream.git
+          # Force: the mirror follows upstream unconditionally, including a
+          # history rewrite on their side.
+          git push --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            main:refs/heads/upstream-main
