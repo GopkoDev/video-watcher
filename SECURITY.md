@@ -2,13 +2,13 @@
 
 ## Supported versions
 
-Only the latest `1.x` release is actively supported.
+Only the latest `2.x` release is actively supported.
 
 ## Reporting a vulnerability
 
-If you find a security vulnerability in claude-video-vision, please **do not open a public issue**.
+If you find a security vulnerability in video-watcher, please **do not open a public issue**.
 
-Instead, report it privately via [GitHub Security Advisories](https://github.com/jordanrendric/claude-video-vision/security/advisories/new).
+Instead, report it privately via [GitHub Security Advisories](https://github.com/GopkoDev/video-watcher/security/advisories/new).
 
 Include:
 - A description of the vulnerability
@@ -28,13 +28,19 @@ In scope:
 Out of scope:
 - Issues in upstream dependencies (report to their maintainers)
 - Issues specific to Claude Code itself
-- Misconfiguration of user-provided API keys
 
 ## Sensitive data
 
 This plugin handles:
 - Video files provided by the user
-- API keys (`GEMINI_API_KEY`, `OPENAI_API_KEY`) from the environment
+- Frames extracted from them
 - Transcribed audio content
 
-None of these are logged or transmitted except to the configured backend (local whisper, Gemini API, or OpenAI API).
+None of it is logged or transmitted anywhere. Processing happens inside the plugin's own
+Node process — ffmpeg as WebAssembly, whisper through transformers.js — and the only
+outbound request the plugin makes is the one-time download of public whisper model weights
+from HuggingFace. The plugin uses no API keys.
+
+Frames and transcripts are of course returned to Claude Code, since that is what lets Claude
+answer questions about the video; they are subject to your Claude Code data handling
+settings.

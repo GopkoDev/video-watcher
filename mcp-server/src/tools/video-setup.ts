@@ -1,58 +1,64 @@
 import { z } from "zod";
+import { arch, platform } from "os";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { checkDependencies } from "../utils/installer.js";
-import { checkCommand, detectPlatform, recommendWhisperModel } from "../utils/platform.js";
+import { MODELS_DIR, loadConfig } from "../config.js";
+import { warmUpFFmpeg } from "../ffmpeg/core.js";
+import { isModelCached, recommendWhisperModel, resolveWhisperModel, totalRamGb } from "../asr/models.js";
+import { loadWhisper } from "../asr/whisper.js";
 
 export function registerVideoSetup(server: McpServer): void {
   server.tool(
     "video_setup",
-    "Check dependencies for video perception (ffmpeg, whisper, gemini api, optional yt-dlp for YouTube URLs).",
+    "Report what the plugin will use on this machine and, with prefetch, download the whisper model up front. There is nothing to install: ffmpeg ships as WebAssembly and the model is fetched once from HuggingFace.",
     {
-      backend: z.enum(["gemini-api", "local", "openai"]).describe("Audio processing backend"),
-      whisper_engine: z.enum(["cpp", "python"]).default("cpp"),
-      whisper_model: z.enum(["tiny", "base", "small", "medium", "large-v3-turbo", "large-v3", "auto"]).default("auto"),
+      prefetch: z.boolean().default(false)
+        .describe("Load ffmpeg and download the whisper model now instead of on the first video"),
     },
-    async ({ backend, whisper_engine, whisper_model }) => {
-      const platform = detectPlatform();
-      const result = await checkDependencies(backend, whisper_engine);
-      const hasYtDlp = await checkCommand("yt-dlp");
+    async ({ prefetch }) => {
+      const config = loadConfig();
+      const ramGb = totalRamGb();
+      const spec = resolveWhisperModel(config.whisper_model, ramGb);
+      const cachedBefore = isModelCached(spec);
 
-      const resolvedModel = whisper_model === "auto"
-        ? recommendWhisperModel(platform.ram_gb)
-        : whisper_model;
-
-      let report = `## Platform Detected\n`;
-      report += `- OS: ${platform.os}\n`;
-      report += `- Architecture: ${platform.arch}\n`;
-      report += `- GPU: ${platform.gpu}\n`;
-      report += `- RAM: ${platform.ram_gb}GB (${platform.free_ram_gb}GB free)\n\n`;
-      report += `## Backend: ${backend}\n\n`;
-
-      if (backend === "local") {
-        report += `- Whisper engine: ${whisper_engine}\n`;
-        report += `- Recommended model: ${resolvedModel}\n\n`;
-      }
-
-      report += `## YouTube URL Support\n`;
-      if (hasYtDlp) {
-        report += `- Status: Ready (\`yt-dlp\` found)\n\n`;
-      } else {
-        const install = platform.os === "macos" ? "brew install yt-dlp" : "pipx install yt-dlp";
-        report += `- Status: Missing optional dependency\n`;
-        report += `- Install: \`${install}\`\n\n`;
-      }
-
-      if (result.status === "ready") {
-        report += `## Status: Ready\nAll dependencies are installed.`;
-      } else {
-        report += `## Status: Missing Dependencies\n\n`;
-        for (let i = 0; i < result.instructions.length; i++) {
-          report += `${i + 1}. \`${result.instructions[i]}\`\n`;
+      let prefetchNote = "";
+      if (prefetch) {
+        await warmUpFFmpeg();
+        try {
+          await loadWhisper(spec);
+          prefetchNote = cachedBefore
+            ? "\nffmpeg loaded; the model was already cached."
+            : `\nffmpeg loaded and whisper-${spec.name} downloaded to ${MODELS_DIR}.`;
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          prefetchNote = `\n**Model download failed:** ${detail}\nCheck your network connection and run video_setup again.`;
         }
-        report += `\n**Please install the missing dependencies and run video_setup again.**`;
       }
 
-      return { content: [{ type: "text", text: report }] };
+      const report = [
+        "## Machine",
+        `- Platform: ${platform()} ${arch()}`,
+        `- Node: ${process.version}`,
+        `- RAM: ${ramGb}GB`,
+        "",
+        "## Dependencies",
+        "- ffmpeg: bundled as WebAssembly (@ffmpeg/core) — nothing to install",
+        "- whisper: bundled via transformers.js — nothing to install",
+        "",
+        "## Whisper model",
+        `- Setting: ${config.whisper_model}${config.whisper_model === "auto" ? ` (auto → ${recommendWhisperModel(ramGb)} for ${ramGb}GB RAM)` : ""}`,
+        `- Model: ${spec.repo} (${spec.notes})`,
+        `- Downloaded: ${isModelCached(spec) ? "yes" : `no — ~${spec.approx_download_mb}MB will be fetched on first use`}`,
+        `- Cache: ${MODELS_DIR}`,
+        `- Language: ${config.whisper_language}`,
+        "",
+        "## Status",
+        isModelCached(spec)
+          ? "Ready. Everything runs offline from here on."
+          : "Ready. The first transcription downloads the model once, then everything runs offline.",
+        prefetchNote,
+      ].join("\n");
+
+      return { content: [{ type: "text" as const, text: report.trimEnd() }] };
     },
   );
 }

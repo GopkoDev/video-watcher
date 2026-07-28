@@ -1,23 +1,23 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "claude-video-vision",
-  "description": "Give Claude the ability to watch and understand videos",
-  "version": "1.3.2",
+  "name": "gopko-dev",
+  "description": "Dmytro Hopko's Claude Code plugins",
+  "version": "2.1.0",
   "owner": {
-    "name": "Jordan Vasconcelos",
-    "url": "https://github.com/jordanrendric"
+    "name": "Dmytro Hopko",
+    "url": "https://github.com/GopkoDev"
   },
   "plugins": [
     {
-      "name": "claude-video-vision",
-      "description": "Give Claude the ability to watch and understand videos — extracts frames via ffmpeg and processes audio via Gemini API, local Whisper, or OpenAI API. Multimodal perception layer for Claude Code.",
-      "version": "1.3.2",
+      "name": "video-watcher",
+      "description": "Give Claude the ability to watch local videos — extracts frames and transcribes audio entirely inside the Node process, with no external binaries and no network calls at runtime. Multimodal perception layer for Claude Code.",
+      "version": "2.1.0",
       "source": "./",
       "category": "productivity",
-      "homepage": "https://github.com/jordanrendric/claude-video-vision",
+      "homepage": "https://github.com/GopkoDev/video-watcher",
       "author": {
-        "name": "Jordan Vasconcelos",
-        "url": "https://github.com/jordanrendric"
+        "name": "Dmytro Hopko",
+        "url": "https://github.com/GopkoDev"
       },
       "tags": [
         "video",
@@ -25,7 +25,7 @@
         "multimodal",
         "ffmpeg",
         "whisper",
-        "gemini",
+        "offline",
         "perception"
       ]
     }

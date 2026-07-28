@@ -18,21 +18,16 @@
  *   npm run measure -- video.mp4 --no-audio
  */
 
-import { mkdirSync, rmSync } from "fs";
 import { getEncoding } from "js-tiktoken";
-import { homedir, tmpdir } from "os";
-import { join } from "path";
-import { transcribeWithWhisper } from "../src/backends/local.js";
+import { resolveWhisperModel } from "../src/asr/models.js";
+import { transcribe } from "../src/asr/whisper.js";
 import { loadConfig } from "../src/config.js";
-import { extractAudio } from "../src/extractors/audio.js";
-import {
-  calculateAutoFps,
-  extractFrames,
-  getVideoMetadata,
-} from "../src/extractors/frames.js";
+import { extractPcm } from "../src/extractors/audio.js";
+import { calculateAutoFps, extractFrames, probeVideo } from "../src/extractors/frames.js";
+import { withVideo } from "../src/ffmpeg/workspace.js";
+import { resolveVideoPath } from "../src/utils/video-path.js";
 import type { AudioResult, Frame, VideoMetadata } from "../src/types.js";
 
-const CONFIG_PATH = join(homedir(), ".claude-video-vision", "config.json");
 const encoder = getEncoding("cl100k_base");
 
 interface MeasureConfig {
@@ -74,43 +69,32 @@ function computeScaledDimensions(
 }
 
 async function processVideo(videoPath: string, config: MeasureConfig) {
-  const metadata = await getVideoMetadata(videoPath);
-  const fps =
-    config.fps === "auto" ? calculateAutoFps(metadata.duration_seconds) : config.fps;
+  const persisted = loadConfig();
+  const maxBytes = persisted.max_input_mb * 1024 * 1024;
 
-  const workDir = join(
-    tmpdir(),
-    `cvv-measure-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-  );
-  mkdirSync(workDir, { recursive: true });
+  const { metadata, fps, frames, pcm } = await withVideo(videoPath, maxBytes, (ws) => {
+    const metadata = probeVideo(ws);
+    const fps = config.fps === "auto" ? calculateAutoFps(metadata.duration_seconds) : config.fps;
 
-  try {
-    const framesDir = join(workDir, "frames");
-    const frames = await extractFrames(videoPath, {
+    const { frames } = extractFrames(ws, {
       fps,
       resolution: config.resolution,
-      outputDir: framesDir,
+      format: persisted.frame_format,
       maxFrames: 1000,
     });
 
-    let audio: AudioResult | null = null;
-    if (config.includeAudio && metadata.has_audio) {
-      const audioDir = join(workDir, "audio");
-      const wavPath = await extractAudio(videoPath, audioDir);
-      const persisted = loadConfig(CONFIG_PATH);
-      const modelDir = join(homedir(), ".claude-video-vision", "models");
-      audio = await transcribeWithWhisper(wavPath, {
-        engine: persisted.whisper_engine,
-        model: persisted.whisper_model,
-        whisperAt: persisted.whisper_at,
-        modelDir,
-      });
-    }
+    const pcm = config.includeAudio && metadata.has_audio ? extractPcm(ws) : null;
+    return { metadata, fps, frames, pcm };
+  });
 
-    return { metadata, fps, frames, audio };
-  } finally {
-    rmSync(workDir, { recursive: true, force: true });
-  }
+  const audio: AudioResult | null = pcm
+    ? await transcribe(pcm, {
+        spec: resolveWhisperModel(persisted.whisper_model),
+        language: persisted.whisper_language,
+      })
+    : null;
+
+  return { metadata, fps, frames, audio };
 }
 
 function estimateTokens(
@@ -127,7 +111,7 @@ function estimateTokens(
   // Transcription block
   let transcriptionTokens = 0;
   if (audio) {
-    const audioText = `\n\n## Audio Analysis\n${JSON.stringify(audio, null, 2)}`;
+    const audioText = `\n\n## Audio\n${JSON.stringify(audio, null, 2)}`;
     transcriptionTokens = countTextTokens(audioText);
   }
 
@@ -266,9 +250,9 @@ function parseArgs(argv: string[]) {
 
 async function main() {
   const { positional, flags } = parseArgs(process.argv.slice(2));
-  const videoPath = positional[0];
+  const rawPath = positional[0];
 
-  if (!videoPath) {
+  if (!rawPath) {
     console.error("Usage: npm run measure -- <video-path> [options]");
     console.error("");
     console.error("Options:");
@@ -279,7 +263,11 @@ async function main() {
     process.exit(1);
   }
 
-  const metadata = await getVideoMetadata(videoPath);
+  const videoPath = resolveVideoPath(rawPath);
+  const persisted = loadConfig();
+  const metadata = await withVideo(videoPath, persisted.max_input_mb * 1024 * 1024, (ws) =>
+    probeVideo(ws),
+  );
   const includeAudio = !flags["no-audio"];
 
   if (flags.matrix) {

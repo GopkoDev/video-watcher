@@ -1,81 +1,62 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { loadConfig, saveConfig, defaultConfig } from "../src/config.js";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "fs";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { mkdirSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
+import { loadConfig, saveConfig, defaultConfig } from "../src/config.js";
 
-const TEST_DIR = join(tmpdir(), "cvv-test-" + Date.now());
+const TEST_DIR = join(tmpdir(), "cvv-config-test-" + Date.now());
+const CONFIG_PATH = join(TEST_DIR, "config.json");
 
 describe("config", () => {
-  beforeEach(() => {
-    mkdirSync(TEST_DIR, { recursive: true });
-  });
+  beforeEach(() => mkdirSync(TEST_DIR, { recursive: true }));
+  afterEach(() => rmSync(TEST_DIR, { recursive: true, force: true }));
 
-  afterEach(() => {
-    rmSync(TEST_DIR, { recursive: true, force: true });
-  });
+  it("returns defaults when no file exists", () => {
+    const config = loadConfig(CONFIG_PATH);
 
-  it("returns default config when no file exists", () => {
-    const config = loadConfig(join(TEST_DIR, "config.json"));
-    expect(config.backend).toBe("unconfigured");
-    expect(config.frame_mode).toBe("images");
+    expect(config.whisper_model).toBe("auto");
+    expect(config.whisper_language).toBe("auto");
     expect(config.frame_format).toBe("jpeg");
     expect(config.frame_resolution).toBe(512);
     expect(config.default_fps).toBe("auto");
     expect(config.max_frames).toBe(100);
-    expect(config.whisper_engine).toBe("cpp");
-    expect(config.frame_describer_model).toBe("sonnet");
+    expect(config.max_input_mb).toBe(1024);
+    expect(config.enable_index).toBe(false);
+    expect(config.session_max_age_days).toBe(7);
   });
 
-  it("saves and loads config", () => {
-    const configPath = join(TEST_DIR, "config.json");
-    const custom = { ...defaultConfig, backend: "local" as const, frame_resolution: 768 };
-    saveConfig(configPath, custom);
-    const loaded = loadConfig(configPath);
-    expect(loaded.backend).toBe("local");
+  it("round-trips a saved config", () => {
+    saveConfig({ ...defaultConfig, whisper_model: "small", frame_resolution: 768 }, CONFIG_PATH);
+    const loaded = loadConfig(CONFIG_PATH);
+
+    expect(loaded.whisper_model).toBe("small");
     expect(loaded.frame_resolution).toBe(768);
   });
 
-  it("merges partial config with defaults", () => {
-    const configPath = join(TEST_DIR, "config.json");
-    writeFileSync(configPath, JSON.stringify({ backend: "openai" }));
-    const loaded = loadConfig(configPath);
-    expect(loaded.backend).toBe("openai");
-    expect(loaded.frame_mode).toBe("images");
+  it("merges a partial config over the defaults", () => {
+    writeFileSync(CONFIG_PATH, JSON.stringify({ whisper_language: "uk" }));
+    const loaded = loadConfig(CONFIG_PATH);
+
+    expect(loaded.whisper_language).toBe("uk");
     expect(loaded.frame_format).toBe("jpeg");
     expect(loaded.max_frames).toBe(100);
   });
 
-  it("returns new defaults for enable_index and session_max_age_days", () => {
-    const config = loadConfig(join(TEST_DIR, "config.json"));
-    expect(config.enable_index).toBe(false);
-    expect(config.session_max_age_days).toBe(7);
-    expect(config.downloads_max_age_days).toBe(7);
+  it("falls back to defaults when the file is not valid JSON", () => {
+    writeFileSync(CONFIG_PATH, "{ not json");
+    const warn = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const loaded = loadConfig(CONFIG_PATH);
+
+    expect(loaded).toEqual(defaultConfig);
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
   });
 
-  it("preserves enable_index when set", () => {
-    const configPath = join(TEST_DIR, "config.json");
-    writeFileSync(configPath, JSON.stringify({ enable_index: true }));
-    const loaded = loadConfig(configPath);
-    expect(loaded.enable_index).toBe(true);
-    expect(loaded.session_max_age_days).toBe(7);
-    expect(loaded.downloads_max_age_days).toBe(7);
-  });
+  it("creates the directory when saving", () => {
+    const nested = join(TEST_DIR, "a", "b", "config.json");
+    saveConfig(defaultConfig, nested);
 
-  it("returns defaults for new audio fields", () => {
-    const config = loadConfig(join(TEST_DIR, "config.json"));
-    expect(config.audio_model).toBe("gemini-3-flash-preview");
-    expect(config.audio_max_output_tokens).toBe(65536);
-    expect(config.audio_chunk_trigger_seconds).toBe(1200);
-    expect(config.audio_chunk_size_seconds).toBe(600);
-    expect(config.audio_chunk_overlap_seconds).toBe(0);
-  });
-
-  it("preserves audio_model override when set", () => {
-    const configPath = join(TEST_DIR, "config.json");
-    writeFileSync(configPath, JSON.stringify({ audio_model: "gemini-3.1-pro-preview" }));
-    const loaded = loadConfig(configPath);
-    expect(loaded.audio_model).toBe("gemini-3.1-pro-preview");
-    expect(loaded.audio_max_output_tokens).toBe(65536);
+    expect(loadConfig(nested)).toEqual(defaultConfig);
   });
 });

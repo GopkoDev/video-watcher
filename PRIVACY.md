@@ -1,76 +1,75 @@
 # Privacy Policy
 
-**Last updated:** 2026-04-22
+**Last updated:** 2026-07-28
 
-This document describes how `claude-video-vision` handles your data.
+This document describes how `video-watcher` handles your data.
 
 ## Summary
 
-- **No telemetry**, no analytics, no account required.
+- **No telemetry**, no analytics, no account, no API key.
 - **No data is collected** by the maintainer of this plugin.
-- Data is processed on your machine and optionally sent to a third-party API **that you explicitly configure**.
+- **Your video never leaves your machine.** Frames and audio are processed inside the
+  plugin's own Node process.
 
 ## Data the plugin processes
 
 When you ask Claude to analyze a video:
 
-1. **The video file you provide** is read from your local filesystem.
-2. **Frames are extracted** using `ffmpeg` into a temporary directory, then deleted after the response.
-3. **Audio is extracted** (when using a local or OpenAI backend) into a temporary `.wav` file, then deleted after the response.
-4. **The video or audio is sent to the backend you configured** (see below).
+1. **The video file you provide** is read from your local filesystem into memory.
+2. **Frames are extracted** by ffmpeg compiled to WebAssembly, running in-process. They
+   live in an in-memory filesystem that is discarded when the call ends.
+3. **Audio is decoded** to raw samples in memory and transcribed locally by a whisper model
+   through transformers.js.
+4. **Frames and transcript are returned to Claude Code**, which is what lets Claude answer
+   your question.
 
-## Backends and data flow
+No part of the video, audio or transcript is uploaded anywhere by this plugin.
 
-You choose one of three backends during `/setup-video-vision`. Each has different privacy implications:
+## Network activity
 
-### Local (Whisper)
+The plugin makes exactly two kinds of network request, both outside normal operation:
 
-- **Runs 100% offline.** Nothing leaves your machine.
-- On first use, the plugin downloads a Whisper model file from HuggingFace (`huggingface.co/ggerganov/whisper.cpp`). This is a one-time download of public model weights.
-- No API key required.
+- **npm registry** — when `npx` fetches the MCP server and its dependencies at install time.
+- **HuggingFace** — a one-time download of public whisper model weights
+  (`huggingface.co/onnx-community/whisper-{tiny,base,small}`) the first time you transcribe
+  anything. The request contains no video data. After it completes, transcription works
+  offline.
 
-### Gemini API
-
-- **Audio is sent to Google's Gemini API** via the endpoint `https://generativelanguage.googleapis.com`.
-- Uses your `GEMINI_API_KEY` environment variable.
-- Data handling is governed by Google's [Gemini API privacy policy](https://ai.google.dev/gemini-api/terms).
-- The plugin does not log, store, or transmit your API key anywhere other than the Google API itself.
-
-### OpenAI Whisper API
-
-- **Audio is sent to OpenAI's Whisper API** via the endpoint `https://api.openai.com`.
-- Uses your `OPENAI_API_KEY` environment variable.
-- Data handling is governed by [OpenAI's privacy policy](https://openai.com/policies/privacy-policy).
-- The plugin does not log, store, or transmit your API key anywhere other than the OpenAI API itself.
+You can perform that download up front with `/setup-video-vision`. There is no other
+outbound traffic — no telemetry endpoint, no analytics, no crash reporting.
 
 ## Local files
 
-The plugin writes and reads from these locations on your machine:
+The plugin writes and reads these locations:
 
-- `~/.claude-video-vision/config.json` — your chosen backend and extraction preferences
-- `~/.claude-video-vision/models/` — downloaded Whisper models (Local backend only)
-- `~/.gemini/tmp/claude-video-vision/` — temporary audio files for the Gemini CLI (deleted after each call)
-- OS temporary directory — frames and audio extracted during a single video analysis (deleted after each call)
+- `~/.claude-video-vision/config.json` — your extraction preferences
+- `~/.claude-video-vision/models/` — cached whisper model weights
+- `~/.claude-video-vision/sessions/` — cached frames, **only when `enable_index` is enabled**;
+  entries expire after `session_max_age_days` (7 by default) and can be wiped at any time
+  with `video_configure({ clear_sessions: true })`
 
-None of these files leave your machine automatically.
+Nothing else is written to disk: frames and audio for a single call exist only in memory.
+None of these files leave your machine.
 
 ## What the maintainer can see
 
-**Nothing.** The plugin does not phone home. There is no telemetry endpoint, no analytics, no crash reporting, no usage tracking. The only network activity initiated by the plugin itself is:
-
-- `npm` registry requests (when `npx` fetches the MCP server binary)
-- HuggingFace model download (Local backend, first use only)
-- The third-party API you configured (Gemini or OpenAI)
+**Nothing.** The plugin does not phone home.
 
 ## Your responsibilities
 
-- You are responsible for not providing videos containing sensitive or regulated data (HIPAA, PII, confidential material) to third-party APIs without ensuring those APIs are compliant with your requirements. Use the Local backend for sensitive content.
-- You are responsible for securing your API keys. The plugin reads them from environment variables only — never commits them anywhere.
+- Frames of your video are sent to Claude as images, and the transcript as text, because
+  that is what "watching a video" means here. They are therefore subject to your Claude
+  Code / Anthropic API data handling settings. Treat a video you analyze the same way you
+  would treat a file you paste into a conversation.
+- Cached session frames (`enable_index`) persist on disk until they expire. Turn the cache
+  off or clear it when working with sensitive footage.
 
 ## Changes to this policy
 
-Changes will be committed to this file in the public GitHub repository. The git history provides a full audit trail.
+Changes are committed to this file in the public GitHub repository. The git history is the
+audit trail.
 
 ## Contact
 
-Questions about this policy: open an issue at https://github.com/jordanrendric/claude-video-vision/issues or reach out to the maintainer at [@jordanrendric](https://github.com/jordanrendric).
+Open an issue at https://github.com/GopkoDev/video-watcher/issues or reach out to
+[@GopkoDev](https://github.com/GopkoDev).

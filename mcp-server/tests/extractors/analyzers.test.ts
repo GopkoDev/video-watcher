@@ -1,8 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
-import { execFile } from "child_process";
-import { promisify } from "util";
-import { mkdtempSync, rmSync } from "fs";
-import { tmpdir } from "os";
+import { describe, it, expect } from "vitest";
 import { join } from "path";
 import {
   buildAnalysisCommand,
@@ -14,9 +10,9 @@ import {
   parseEbur128Output,
   deriveContentProfile,
 } from "../../src/extractors/analyzers.js";
+import { withVideo } from "../../src/ffmpeg/workspace.js";
 import type { AnalysisFilters } from "../../src/types.js";
 
-const execFileAsync = promisify(execFile);
 const SILENCE_FIXTURE = join(import.meta.dirname, "../fixtures/silence-5s.mp4");
 
 // ---------------------------------------------------------------------------
@@ -97,31 +93,20 @@ describe("buildAnalysisCommand", () => {
     expect(result!.videoMetaFile).toContain("video_meta.txt");
   });
 
-  it("escapes Windows drive-letter paths in the metadata filter (regression: lavfi parse failure on Windows)", () => {
+  it("writes the metadata sink to a plain MEMFS path", () => {
+    // Paths inside the wasm filesystem are always POSIX and always ours, so no
+    // lavfi escaping is needed — and none must be introduced, since a stray
+    // backslash would make lavfi mis-parse the filter value.
     const result = buildAnalysisCommand(
-      "/video.mp4",
+      "/job0/input.mp4",
       makeFilters({ scene_changes: true }),
-      "C:\\Users\\Jordan\\AppData\\Local\\Temp\\session",
+      "/job0/work",
     );
     expect(result).not.toBeNull();
-    const vfValue = result!.args[result!.args.indexOf("-vf") + 1];
-    // No raw `\Letter` separators survive — those are what lavfi mis-parses as escapes.
-    expect(vfValue).not.toMatch(/\\[A-Za-z]/);
-    // Drive-letter colon arrives at ffmpeg as two real backslashes + colon, so
-    // lavfi's two-level escape parser yields a literal `:` in the value.
-    expect(vfValue).toMatch(/file=C\\\\:\/Users\/Jordan\/AppData\/Local\/Temp\/session/);
-  });
 
-  it("leaves POSIX paths unchanged in the metadata filter", () => {
-    const result = buildAnalysisCommand(
-      "/video.mp4",
-      makeFilters({ scene_changes: true }),
-      "/tmp/work",
-    );
-    expect(result).not.toBeNull();
     const vfValue = result!.args[result!.args.indexOf("-vf") + 1];
-    expect(vfValue).toContain("file=/tmp/work/video_meta.txt");
-    expect(vfValue).not.toContain("\\\\");
+    expect(vfValue).toContain("file=/job0/work/video_meta.txt");
+    expect(vfValue).not.toContain("\\");
   });
 
   it("does not append ametadata sink to audio filter chain (regression: silencedetect events vanish when ametadata=print is present)", () => {
@@ -144,29 +129,23 @@ describe("buildAnalysisCommand", () => {
 // ---------------------------------------------------------------------------
 
 describe("buildAnalysisCommand integration", () => {
-  let workDir: string;
+  // Runs through the bundled wasm ffmpeg, exactly like video_analyze does — the
+  // suite must not depend on a system ffmpeg being installed.
+  it(
+    "finds silences in synthesized fixture (regression: ametadata sink used to swallow events)",
+    { timeout: 120_000 },
+    async () => {
+      const intervals = await withVideo(SILENCE_FIXTURE, 512 * 1024 * 1024, (ws) => {
+        const cmd = buildAnalysisCommand(ws.input, makeFilters({ silence: true }), ws.work);
+        expect(cmd).not.toBeNull();
 
-  afterEach(() => {
-    if (workDir) rmSync(workDir, { recursive: true, force: true });
-  });
+        return parseSilenceOutput(ws.exec(cmd!.args).log);
+      });
 
-  it("finds silences in synthesized fixture (regression: ametadata sink used to swallow events)", async () => {
-    workDir = mkdtempSync(join(tmpdir(), "cvv-analyzers-test-"));
-    const cmd = buildAnalysisCommand(SILENCE_FIXTURE, makeFilters({ silence: true }), workDir);
-    expect(cmd).not.toBeNull();
-
-    let stderr = "";
-    try {
-      const r = await execFileAsync("ffmpeg", cmd!.args, { maxBuffer: 100 * 1024 * 1024 });
-      stderr = r.stderr;
-    } catch (err: any) {
-      stderr = err.stderr || "";
-    }
-
-    const intervals = parseSilenceOutput(stderr);
-    expect(intervals.length).toBeGreaterThan(0);
-    expect(intervals[0].duration).toBeGreaterThan(0.5);
-  });
+      expect(intervals.length).toBeGreaterThan(0);
+      expect(intervals[0].duration).toBeGreaterThan(0.5);
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------

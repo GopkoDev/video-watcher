@@ -1,61 +1,47 @@
 import { z } from "zod";
-import { join } from "path";
-import { homedir } from "os";
 import { rmSync, existsSync } from "fs";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { loadConfig, saveConfig } from "../config.js";
-
-const CONFIG_PATH = join(homedir(), ".claude-video-vision", "config.json");
+import { CONFIG_PATH, SESSIONS_DIR, loadConfig, saveConfig } from "../config.js";
 
 export function registerVideoConfigure(server: McpServer): void {
   server.tool(
     "video_configure",
-    "Configure video perception preferences (backend, resolution, fps, whisper model, etc.)",
+    "Change video perception preferences: whisper model size and language, frame format/resolution/fps, frame limits and the session cache.",
     {
-      backend: z.enum(["gemini-api", "local", "openai"]).optional(),
-      whisper_engine: z.enum(["cpp", "python"]).optional(),
-      whisper_model: z.enum(["tiny", "base", "small", "medium", "large-v3-turbo", "large-v3", "auto"]).optional(),
-      whisper_at: z.boolean().optional(),
-      frame_mode: z.enum(["images", "descriptions"]).optional(),
+      whisper_model: z
+        .enum(["auto", "tiny", "base", "small", "medium", "large-v3-turbo", "large-v3"])
+        .optional()
+        .describe("Whisper size; 'auto' picks one from installed RAM. Larger models download more and run slower, but transcribe non-English speech far better."),
+      whisper_language: z.string().min(2).max(10).optional()
+        .describe("ISO-639-1 code, or 'auto' to detect per video"),
       frame_format: z.enum(["jpeg", "png", "webp"]).optional(),
       frame_resolution: z.number().min(128).max(2048).optional(),
       default_fps: z.union([z.number().positive(), z.literal("auto")]).optional(),
       max_frames: z.number().min(1).max(1000).optional(),
-      frame_describer_model: z.enum(["opus", "sonnet", "haiku"]).optional(),
+      max_input_mb: z.number().min(16).max(8192).optional()
+        .describe("Largest video that may be loaded into wasm memory"),
       enable_index: z.boolean().optional(),
       session_max_age_days: z.number().min(1).optional(),
-      downloads_max_age_days: z.number().min(1).optional(),
-      clear_sessions: z.boolean().optional(),
-      audio_model: z.string().min(1).optional(),
-      audio_max_output_tokens: z.number().min(1024).max(200000).optional(),
-      audio_chunk_trigger_seconds: z.number().min(60).optional(),
-      audio_chunk_size_seconds: z.number().min(60).optional(),
-      audio_chunk_overlap_seconds: z.number().min(0).max(60).optional(),
+      clear_sessions: z.boolean().optional().describe("Delete every cached session before applying changes"),
     },
     async (params) => {
-      if (params.clear_sessions) {
-        const sessionsDir = join(homedir(), ".claude-video-vision", "sessions");
-        if (existsSync(sessionsDir)) {
-          rmSync(sessionsDir, { recursive: true, force: true });
-        }
+      if (params.clear_sessions && existsSync(SESSIONS_DIR)) {
+        rmSync(SESSIONS_DIR, { recursive: true, force: true });
       }
 
-      const current = loadConfig(CONFIG_PATH);
-      const updated = { ...current };
-
+      const updated = { ...loadConfig() };
       for (const [key, value] of Object.entries(params)) {
         if (value !== undefined && key !== "clear_sessions") {
-          (updated as any)[key] = value;
+          (updated as Record<string, unknown>)[key] = value;
         }
       }
 
-      saveConfig(CONFIG_PATH, updated);
+      saveConfig(updated);
 
-      let responseText = `Configuration saved to ${CONFIG_PATH}:\n${JSON.stringify(updated, null, 2)}`;
-      if (params.clear_sessions) {
-        responseText += "\n\nAll sessions have been cleared.";
-      }
-      return { content: [{ type: "text", text: responseText }] };
+      let text = `Configuration saved to ${CONFIG_PATH}:\n${JSON.stringify(updated, null, 2)}`;
+      if (params.clear_sessions) text += "\n\nAll cached sessions were deleted.";
+
+      return { content: [{ type: "text" as const, text }] };
     },
   );
 }

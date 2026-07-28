@@ -1,50 +1,68 @@
-import { execFile } from "child_process";
-import { promisify } from "util";
-import { readFileSync, readdirSync, mkdirSync, existsSync } from "fs";
-import { join } from "path";
-import type { VideoMetadata, Frame, FrameFormat, Segment } from "../types.js";
+import type { VideoWorkspace } from "../ffmpeg/workspace.js";
+import type { Frame, FrameFormat, Segment, VideoMetadata } from "../types.js";
 import { formatHMS, parseHMS } from "../utils/timestamps.js";
 
-const execFileAsync = promisify(execFile);
+// ---------------------------------------------------------------------------
+// Metadata
+// ---------------------------------------------------------------------------
 
-export async function getVideoMetadata(videoPath: string): Promise<VideoMetadata> {
-  const { stdout } = await execFileAsync("ffprobe", [
-    "-v", "quiet",
-    "-print_format", "json",
-    "-show_format",
-    "-show_streams",
-    videoPath,
-  ]);
+/**
+ * Reads the stream summary that ffmpeg prints when it is given an input and no
+ * output. The run costs nothing — ffmpeg parses the header, complains that no
+ * output was specified, and exits.
+ *
+ * ffprobe is deliberately not used: this wasm build shares one instance across
+ * calls, and once `ffprobe()` has run on it every later `exec()` aborts. Since
+ * the plugin needs metadata *and* frames from the same instance, metadata has
+ * to come from ffmpeg itself.
+ */
+export function parseProbeLog(log: string, fileSizeBytes: number): VideoMetadata {
+  const durationMatch = log.match(/Duration:\s*(\d+):(\d{2}):(\d{2})\.(\d+)/);
+  const durationSeconds = durationMatch
+    ? Number(durationMatch[1]) * 3600 +
+      Number(durationMatch[2]) * 60 +
+      Number(durationMatch[3]) +
+      Number(`0.${durationMatch[4]}`)
+    : 0;
 
-  const probe = JSON.parse(stdout);
-  const videoStream = probe.streams.find((s: any) => s.codec_type === "video");
-  const audioStream = probe.streams.find((s: any) => s.codec_type === "audio");
-  const format = probe.format;
+  const streamLines = log.split("\n").filter((line) => /^\s*Stream #\d+:\d+/.test(line));
+  const videoLines = streamLines.filter((line) => /:\s*Video:/.test(line));
+  // Cover art is muxed in as a one-frame video stream; the real track wins.
+  const videoLine = videoLines.find((line) => !line.includes("attached pic")) ?? videoLines[0];
 
-  const durationSec = parseFloat(format.duration || videoStream?.duration || "0");
-  const minutes = Math.floor(durationSec / 60);
-  const seconds = Math.floor(durationSec % 60);
-  const duration = `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  if (!videoLine) {
+    throw new Error(`No video stream found in this file.\n${log.split("\n").slice(-6).join("\n")}`);
+  }
 
-  const fileSizeBytes = parseInt(format.size || "0", 10);
-  const fileSizeMB = (fileSizeBytes / (1024 * 1024)).toFixed(1);
+  const dimensions = videoLine.match(/\b(\d{2,5})x(\d{2,5})\b/);
+  const width = dimensions ? Number(dimensions[1]) : 0;
+  const height = dimensions ? Number(dimensions[2]) : 0;
 
-  const fpsStr = videoStream?.r_frame_rate || "30/1";
-  const [num, den] = fpsStr.split("/").map(Number);
-  const originalFps = Math.round(num / (den || 1));
+  const codec = videoLine.match(/:\s*Video:\s*([A-Za-z0-9_]+)/)?.[1] ?? "unknown";
+  // Prefer the reported frame rate, falling back to the container's tbr.
+  const fps = videoLine.match(/,\s*([\d.]+)\s*fps\b/)?.[1] ?? videoLine.match(/,\s*([\d.]+)\s*tbr\b/)?.[1];
 
   return {
-    duration,
-    duration_seconds: durationSec,
-    resolution: `${videoStream?.width || 0}x${videoStream?.height || 0}`,
-    width: videoStream?.width || 0,
-    height: videoStream?.height || 0,
-    codec: videoStream?.codec_name || "unknown",
-    original_fps: originalFps,
-    file_size: `${fileSizeMB}MB`,
-    has_audio: !!audioStream,
+    duration: formatHMS(durationSeconds),
+    duration_seconds: durationSeconds,
+    resolution: `${width}x${height}`,
+    width,
+    height,
+    codec,
+    original_fps: fps ? Math.round(Number(fps)) : 0,
+    file_size: `${(fileSizeBytes / (1024 * 1024)).toFixed(1)}MB`,
+    has_audio: streamLines.some((line) => /:\s*Audio:/.test(line)),
   };
 }
+
+export function probeVideo(ws: VideoWorkspace): VideoMetadata {
+  const { log } = ws.exec(["-hide_banner", "-i", ws.input]);
+  return parseProbeLog(log, ws.inputSize);
+}
+
+// ---------------------------------------------------------------------------
+// Frame extraction
+// ---------------------------------------------------------------------------
 
 export function calculateAutoFps(durationSeconds: number): number {
   if (durationSeconds < 60) return 2;
@@ -52,16 +70,6 @@ export function calculateAutoFps(durationSeconds: number): number {
   if (durationSeconds < 900) return 0.5;
   if (durationSeconds < 3600) return 0.2;
   return 0.1;
-}
-
-export interface ExtractFramesOptions {
-  fps: number;
-  resolution: number;
-  outputDir: string;
-  format?: FrameFormat;
-  startTime?: string;
-  endTime?: string;
-  maxFrames?: number;
 }
 
 export function frameFormatExtension(format: FrameFormat): string {
@@ -78,151 +86,122 @@ function frameQualityArgs(format: FrameFormat): string[] {
   return [];
 }
 
-function isMissingWebpEncoderError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  const message = error.message.toLowerCase();
-  return (
-    message.includes("codec webp") &&
-    (message.includes("encoder not found") ||
-      message.includes("error selecting an encoder") ||
-      message.includes("encoder for format image2") ||
-      message.includes("disabled"))
-  );
+export interface ExtractFramesOptions {
+  fps: number;
+  resolution: number;
+  format: FrameFormat;
+  startTime?: string;
+  endTime?: string;
+  maxFrames: number;
+  /** Sub-directory name inside the workspace scratch dir. */
+  outputName?: string;
 }
 
-export async function extractFrames(
-  videoPath: string,
+/**
+ * Builds the ffmpeg argv for one extraction pass.
+ *
+ * `-ss` is an input option (fast seek) while `-to` would be measured from the
+ * seek point rather than from the start of the file, so a range is expressed as
+ * an explicit `-t <duration>` instead. That keeps `end_time` absolute, which is
+ * what every caller means by it.
+ */
+export function buildFrameArgs(
+  input: string,
+  outputPattern: string,
   options: ExtractFramesOptions,
-): Promise<Frame[]> {
-  const {
-    fps,
-    resolution,
-    outputDir,
-    format = "jpeg",
-    startTime,
-    endTime,
-    maxFrames = 100,
-  } = options;
-  const extension = frameFormatExtension(format);
+): string[] {
+  const args: string[] = ["-hide_banner"];
+  const startSeconds = options.startTime ? parseHMS(options.startTime) : 0;
 
-  if (!existsSync(outputDir)) {
-    mkdirSync(outputDir, { recursive: true });
+  if (options.startTime) {
+    args.push("-ss", options.startTime);
   }
 
-  const args: string[] = [];
+  args.push("-i", input);
 
-  if (startTime) {
-    args.push("-ss", startTime);
-  }
-
-  args.push("-i", videoPath);
-
-  if (endTime) {
-    args.push("-to", endTime);
+  if (options.endTime) {
+    const duration = parseHMS(options.endTime) - startSeconds;
+    if (duration <= 0) {
+      throw new Error(`end_time (${options.endTime}) must be after start_time (${options.startTime ?? "00:00:00"}).`);
+    }
+    args.push("-t", String(duration));
   }
 
   args.push(
-    "-vf", `fps=${fps},scale=${resolution}:-1`,
-    "-frames:v", String(maxFrames),
-    ...frameQualityArgs(format),
-    join(outputDir, `frame_%04d.${extension}`),
+    "-vf", `fps=${options.fps},scale=${options.resolution}:-1`,
+    "-frames:v", String(options.maxFrames),
+    ...frameQualityArgs(options.format),
+    "-y",
+    outputPattern,
   );
 
-  try {
-    await execFileAsync("ffmpeg", args);
-  } catch (error) {
-    if (format === "webp" && isMissingWebpEncoderError(error)) {
-      throw new Error(
-        "WebP frame extraction requires an ffmpeg build with a WebP encoder (libwebp). " +
-          "Use frame_format='jpeg' or frame_format='png', or install an ffmpeg build such as ffmpeg-full.",
-        { cause: error },
-      );
-    }
-    throw error;
-  }
+  return args;
+}
 
-  const files = readdirSync(outputDir)
+export interface ExtractedFrames {
+  frames: Frame[];
+  /** True when maxFrames cut the range short. */
+  truncated: boolean;
+}
+
+export function extractFrames(ws: VideoWorkspace, options: ExtractFramesOptions): ExtractedFrames {
+  const extension = frameFormatExtension(options.format);
+  const dir = ws.mkdir(options.outputName ?? `frames-${Math.round(options.resolution)}-${options.fps}`);
+  const args = buildFrameArgs(ws.input, `${dir}/frame_%04d.${extension}`, options);
+
+  const result = ws.exec(args);
+  const files = ws.list(dir)
     .filter((f) => f.startsWith("frame_") && f.endsWith(`.${extension}`))
     .sort();
 
-  const offsetSeconds = startTime ? parseHMS(startTime) : 0;
+  if (files.length === 0) {
+    throw new Error(`ffmpeg produced no frames (exit ${result.code}).\n${tailLog(result.log)}`);
+  }
 
-  return files.map((file, index) => {
-    const filePath = join(outputDir, file);
-    const imageData = readFileSync(filePath);
-    const base64 = imageData.toString("base64");
-    const timestamp = formatHMS(offsetSeconds + index / fps);
+  const offsetSeconds = options.startTime ? parseHMS(options.startTime) : 0;
 
-    return {
-      timestamp,
-      image: base64,
-      format,
-      sourcePath: filePath,
-    };
-  });
+  const frames: Frame[] = files.map((file, index) => ({
+    timestamp: formatHMS(offsetSeconds + index / options.fps),
+    image: Buffer.from(ws.readFile(`${dir}/${file}`)).toString("base64"),
+    format: options.format,
+  }));
+
+  return { frames, truncated: files.length >= options.maxFrames };
 }
-
-// ---------------------------------------------------------------------------
-// Segment-based frame extraction
-// ---------------------------------------------------------------------------
 
 export interface SegmentFrame extends Frame {
   resolution: number;
 }
 
-/**
- * Generates HH:MM:SS timestamp strings for every sample point within a
- * segment according to the segment's fps setting.
- *
- * The range is [start, end) — the end boundary is exclusive so that a segment
- * ending exactly at the next segment's start time never overlaps.
- */
-export function generateTimestampsForSegment(segment: Segment): string[] {
-  const startSec = parseHMS(segment.start);
-  const endSec = parseHMS(segment.end);
-  const interval = 1 / segment.fps;
-  const timestamps: string[] = [];
-
-  for (let t = startSec; t < endSec; t += interval) {
-    timestamps.push(formatHMS(Math.round(t)));
-  }
-
-  return timestamps;
-}
-
-/**
- * Extracts frames for an ordered list of segments, each potentially at a
- * different resolution and fps.  Frames from each segment are written into a
- * sub-directory named after their resolution so they never collide.
- */
-export async function extractFramesBySegments(
-  videoPath: string,
+export function extractFramesBySegments(
+  ws: VideoWorkspace,
   segments: Segment[],
-  baseOutputDir: string,
-  format: FrameFormat = "jpeg",
-): Promise<SegmentFrame[]> {
-  const allFrames: SegmentFrame[] = [];
+  format: FrameFormat,
+  defaultResolution: number,
+  maxFramesPerSegment: number,
+): SegmentFrame[] {
+  const all: SegmentFrame[] = [];
 
-  for (const segment of segments) {
-    const resolution = segment.resolution ?? 512;
-    const resDir = join(baseOutputDir, String(resolution));
-
-    if (!existsSync(resDir)) mkdirSync(resDir, { recursive: true });
-
-    const frames = await extractFrames(videoPath, {
+  segments.forEach((segment, index) => {
+    const resolution = segment.resolution ?? defaultResolution;
+    const { frames } = extractFrames(ws, {
       fps: segment.fps,
       resolution,
-      outputDir: resDir,
       format,
       startTime: segment.start,
       endTime: segment.end,
-      maxFrames: 1000,
+      maxFrames: maxFramesPerSegment,
+      outputName: `segment-${index}`,
     });
 
     for (const frame of frames) {
-      allFrames.push({ ...frame, resolution });
+      all.push({ ...frame, resolution });
     }
-  }
+  });
 
-  return allFrames;
+  return all;
+}
+
+function tailLog(log: string, lines = 12): string {
+  return log.split("\n").slice(-lines).join("\n");
 }

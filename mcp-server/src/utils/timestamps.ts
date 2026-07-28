@@ -1,4 +1,4 @@
-import type { AudioResult, AudioTag, TranscriptionSegment } from "../types.js";
+import type { AudioResult, TranscriptionSegment } from "../types.js";
 
 export function parseHMS(timestamp: string): number {
   const parts = timestamp.split(":").map(Number);
@@ -25,7 +25,7 @@ export function shiftAudioResult(
     return result;
   }
 
-  const shiftSegment = <T extends TranscriptionSegment | AudioTag>(entry: T): T => ({
+  const shiftSegment = (entry: TranscriptionSegment): TranscriptionSegment => ({
     ...entry,
     start: formatHMS(parseHMS(entry.start) + offsetSeconds),
     end: formatHMS(parseHMS(entry.end) + offsetSeconds),
@@ -34,6 +34,5 @@ export function shiftAudioResult(
   return {
     ...result,
     transcription: result.transcription.map(shiftSegment),
-    audio_tags: result.audio_tags.map(shiftSegment),
   };
 }

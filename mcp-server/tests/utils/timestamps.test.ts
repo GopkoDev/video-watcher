@@ -60,92 +60,73 @@ describe("formatHMS", () => {
 
 describe("shiftAudioResult", () => {
   const baseResult: AudioResult = {
-    backend: "local",
+    engine: "whisper",
+    model: "onnx-community/whisper-base",
+    language: "en",
+    language_detected: true,
     transcription: [
       { start: "00:00:00", end: "00:00:05", text: "hello" },
       { start: "00:00:05", end: "00:00:10", text: "world" },
     ],
-    audio_tags: [
-      { start: "00:00:02", end: "00:00:08", tag: "music" },
-    ],
-    full_analysis: null,
+    full_text: "hello world",
   };
 
   it("returns the same reference when offset is zero", () => {
-    const shifted = shiftAudioResult(baseResult, 0);
-    expect(shifted).toBe(baseResult);
+    expect(shiftAudioResult(baseResult, 0)).toBe(baseResult);
   });
 
-  it("adds offset to all transcription timestamps", () => {
+  it("adds the offset to every transcription timestamp", () => {
     const shifted = shiftAudioResult(baseResult, 10);
+
     expect(shifted.transcription[0].start).toBe("00:00:10");
     expect(shifted.transcription[0].end).toBe("00:00:15");
     expect(shifted.transcription[1].start).toBe("00:00:15");
     expect(shifted.transcription[1].end).toBe("00:00:20");
   });
 
-  it("adds offset to all audio_tags timestamps", () => {
-    const shifted = shiftAudioResult(baseResult, 10);
-    expect(shifted.audio_tags[0].start).toBe("00:00:12");
-    expect(shifted.audio_tags[0].end).toBe("00:00:18");
-  });
-
-  it("preserves tag labels and transcription text", () => {
-    const shifted = shiftAudioResult(baseResult, 10);
-    expect(shifted.transcription[0].text).toBe("hello");
-    expect(shifted.audio_tags[0].tag).toBe("music");
+  it("preserves the transcript text", () => {
+    expect(shiftAudioResult(baseResult, 10).transcription[0].text).toBe("hello");
   });
 
   it("handles minute-scale offsets", () => {
     const shifted = shiftAudioResult(baseResult, 125);
+
     expect(shifted.transcription[0].start).toBe("00:02:05");
     expect(shifted.transcription[1].end).toBe("00:02:15");
   });
 
   it("handles hour-scale offsets", () => {
-    const shifted = shiftAudioResult(baseResult, 3625);
-    expect(shifted.transcription[0].start).toBe("01:00:25");
+    expect(shiftAudioResult(baseResult, 3625).transcription[0].start).toBe("01:00:25");
   });
 
   it("does not mutate the input", () => {
     const snapshot = JSON.stringify(baseResult);
     shiftAudioResult(baseResult, 42);
+
     expect(JSON.stringify(baseResult)).toBe(snapshot);
   });
 
-  it("preserves the backend and full_analysis fields", () => {
+  it("carries the provenance fields through the shift", () => {
     const shifted = shiftAudioResult(baseResult, 10);
-    expect(shifted.backend).toBe("local");
-    expect(shifted.full_analysis).toBeNull();
+
+    expect(shifted.engine).toBe("whisper");
+    expect(shifted.model).toBe("onnx-community/whisper-base");
+    expect(shifted.language).toBe("en");
+    expect(shifted.language_detected).toBe(true);
+    expect(shifted.full_text).toBe("hello world");
   });
 
-  it("preserves warnings field through spread when shifting", () => {
-    const input: AudioResult = {
-      backend: "gemini-api",
-      transcription: [{ start: "00:00:00", end: "00:00:05", text: "hi" }],
-      audio_tags: [],
-      full_analysis: null,
-      warnings: [
-        { chunk_index: 0, chunk_total: 2, time_range: "00:00:00-00:10:00", event: "hard_cut", detail: "no silence" },
-      ],
-    };
-    const result = shiftAudioResult(input, 60);
-    expect(result.warnings).toBeDefined();
-    expect(result.warnings).toHaveLength(1);
-    expect(result.warnings![0].event).toBe("hard_cut");
-  });
-
-  it("preserves warnings even when offset is 0 (returns input unchanged)", () => {
-    const input: AudioResult = {
-      backend: "gemini-api",
+  it("leaves a skipped result untouched", () => {
+    const skipped: AudioResult = {
+      engine: "none",
+      model: null,
+      language: null,
+      language_detected: false,
       transcription: [],
-      audio_tags: [],
-      full_analysis: null,
-      warnings: [
-        { chunk_index: 0, chunk_total: 1, time_range: "00:00:00-00:05:00", event: "retry", detail: "transient" },
-      ],
+      full_text: "",
+      skipped_reason: "video has no audio track",
     };
-    const result = shiftAudioResult(input, 0);
-    expect(result.warnings).toEqual(input.warnings);
+
+    expect(shiftAudioResult(skipped, 60).skipped_reason).toBe("video has no audio track");
   });
 });

@@ -1,26 +1,9 @@
-import { join } from "path";
 import type { AnalysisFilters, SceneChange, Interval } from "../types.js";
 import { formatHMS } from "../utils/timestamps.js";
 
 // ---------------------------------------------------------------------------
 // Command builder
 // ---------------------------------------------------------------------------
-
-// lavfi filter values treat `:` as the argument separator and `\` as the
-// escape character. On Windows a path like `C:\Users\...` breaks the parser
-// twice (drive-letter colon and backslashes). Convert backslashes to forward
-// slashes (ffmpeg accepts either) and escape the drive-letter colon.
-//
-// lavfi uses two levels of escape parsing inside ffmpeg (filtergraph level +
-// filter-option-value level), so a literal `:` inside a value must arrive as
-// `\\:` (two real backslashes + colon) in the argv string passed to ffmpeg.
-// In a JS string literal that's "\\\\:" — four source characters representing
-// two `\` characters.
-//
-// Unix paths are unaffected because they have no drive letter and no `\`.
-function escapeLavfiPath(p: string): string {
-  return p.replace(/\\/g, "/").replace(/^([A-Za-z]):/, "$1\\\\:");
-}
 
 export interface AnalysisCommandResult {
   args: string[];
@@ -29,8 +12,11 @@ export interface AnalysisCommandResult {
 
 /**
  * Builds an ffmpeg args array that runs the selected lavfi filter pipeline and
- * writes per-frame metadata to files.  Transcription is NOT an ffmpeg filter —
- * the caller must handle it separately.
+ * writes per-frame metadata to a file. Transcription is NOT an ffmpeg filter —
+ * the caller handles it separately.
+ *
+ * Paths here are MEMFS paths (`/jobN/...`), so they never contain a Windows
+ * drive letter or a backslash and need no lavfi escaping.
  *
  * Returns `null` when no ffmpeg-based filter is selected.
  */
@@ -39,7 +25,7 @@ export function buildAnalysisCommand(
   filters: AnalysisFilters,
   workDir: string,
 ): AnalysisCommandResult | null {
-  const videoMetaFile = join(workDir, "video_meta.txt");
+  const videoMetaFile = `${workDir}/video_meta.txt`;
 
   // Video filter chain
   const videoFilters: string[] = [];
@@ -67,7 +53,7 @@ export function buildAnalysisCommand(
   // Always append metadata sink when any video filter is active —
   // scdet, blurdetect, signalstats all write to frame metadata
   if (videoFilters.length > 0) {
-    videoFilters.push(`metadata=mode=print:file=${escapeLavfiPath(videoMetaFile)}`);
+    videoFilters.push(`metadata=mode=print:file=${videoMetaFile}`);
   }
 
   // Audio filter chain
@@ -90,7 +76,7 @@ export function buildAnalysisCommand(
   }
 
   // Build args
-  const args: string[] = ["-i", videoPath, "-y"];
+  const args: string[] = ["-hide_banner", "-i", videoPath, "-y"];
 
   if (hasVideoFilters) {
     args.push("-vf", videoFilters.join(","));

@@ -28,14 +28,8 @@ jobs:
           cache: npm
           cache-dependency-path: mcp-server/package-lock.json
 
-      - name: Install ffmpeg (macOS)
-        if: matrix.os == 'macos-latest'
-        run: brew install ffmpeg
-
-      - name: Install ffmpeg (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
+      # No system dependencies: ffmpeg ships as WebAssembly and whisper runs
+      # through transformers.js.
       - name: Install dependencies
         working-directory: mcp-server
         run: npm ci

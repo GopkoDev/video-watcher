@@ -1,4 +1,4 @@
-# Contributing to claude-video-vision
+# Contributing to VideoWatcher
 
 Thanks for your interest in contributing! This document explains how to get set up and submit changes.
 
@@ -6,8 +6,8 @@ Thanks for your interest in contributing! This document explains how to get set 
 
 ```bash
 # Clone and install
-git clone https://github.com/jordanrendric/claude-video-vision.git
-cd claude-video-vision/mcp-server
+git clone https://github.com/GopkoDev/video-watcher.git
+cd video-watcher/mcp-server
 npm install
 
 # Build
@@ -25,7 +25,7 @@ You'll need `ffmpeg` installed (`brew install ffmpeg` on macOS, `apt install ffm
 ## Testing the plugin locally
 
 ```bash
-claude --plugin-dir /path/to/claude-video-vision
+claude --plugin-dir /path/to/video-watcher
 ```
 
 ## Making a change
@@ -66,4 +66,4 @@ Open an issue using the bug report template. Include:
 
 ## Questions
 
-Open a discussion or reach out to [@jordanrendric](https://github.com/jordanrendric).
+Open a discussion or reach out to [@GopkoDev](https://github.com/GopkoDev).

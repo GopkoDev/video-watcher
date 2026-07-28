@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a bug in claude-video-vision
+description: Report a bug in VideoWatcher
 labels: [bug]
 body:
   - type: textarea
@@ -22,14 +22,16 @@ body:
       required: true
 
   - type: dropdown
-    id: backend
+    id: whisper_model
     attributes:
-      label: Backend
+      label: Whisper model
+      description: From `video_setup`, or your `whisper_model` setting
       options:
-        - Gemini API
-        - Local (Whisper)
-        - OpenAI API
-        - Not yet configured
+        - auto
+        - tiny
+        - base
+        - small
+        - Not sure
     validations:
       required: true
 

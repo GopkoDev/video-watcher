@@ -1,37 +1,48 @@
-import { execFile } from "child_process";
-import { promisify } from "util";
-import { mkdirSync, existsSync } from "fs";
-import { join } from "path";
-
-const execFileAsync = promisify(execFile);
+import type { VideoWorkspace } from "../ffmpeg/workspace.js";
+import { SAMPLE_RATE } from "../asr/whisper.js";
+import { parseHMS } from "../utils/timestamps.js";
 
 export interface ExtractAudioOptions {
   startTime?: string;
   endTime?: string;
-  filename?: string;
 }
 
-export function buildExtractArgs(
-  videoPath: string,
+/**
+ * Decodes straight to headerless 32-bit float PCM at whisper's sample rate, so
+ * the result can be handed to the model without a WAV parser in between.
+ *
+ * The seek/range flags mirror `buildFrameArgs` exactly — same `-ss` placement,
+ * same explicit `-t` — so frames and transcript always describe the same span
+ * of the video.
+ */
+export function buildAudioArgs(
+  input: string,
   outputPath: string,
   options: ExtractAudioOptions,
 ): string[] {
-  const args: string[] = ["-i", videoPath];
+  const args: string[] = ["-hide_banner"];
+  const startSeconds = options.startTime ? parseHMS(options.startTime) : 0;
 
-  // Output accurate-seek: -ss AFTER -i. Slower but sample-accurate.
   if (options.startTime) {
     args.push("-ss", options.startTime);
   }
 
+  args.push("-i", input);
+
   if (options.endTime) {
-    args.push("-to", options.endTime);
+    const duration = parseHMS(options.endTime) - startSeconds;
+    if (duration <= 0) {
+      throw new Error(`end_time (${options.endTime}) must be after start_time (${options.startTime ?? "00:00:00"}).`);
+    }
+    args.push("-t", String(duration));
   }
 
   args.push(
     "-vn",
-    "-acodec", "pcm_s16le",
-    "-ar", "16000",
     "-ac", "1",
+    "-ar", String(SAMPLE_RATE),
+    "-f", "f32le",
+    "-acodec", "pcm_f32le",
     "-y",
     outputPath,
   );
@@ -39,19 +50,18 @@ export function buildExtractArgs(
   return args;
 }
 
-export async function extractAudio(
-  videoPath: string,
-  outputDir: string,
-  options: ExtractAudioOptions = {},
-): Promise<string> {
-  if (!existsSync(outputDir)) {
-    mkdirSync(outputDir, { recursive: true });
+export function extractPcm(ws: VideoWorkspace, options: ExtractAudioOptions = {}): Float32Array {
+  const outPath = `${ws.work}/audio.f32`;
+  const result = ws.exec(buildAudioArgs(ws.input, outPath, options));
+
+  if (!ws.exists(outPath)) {
+    throw new Error(`Could not decode audio (ffmpeg exit ${result.code}).\n${result.log.split("\n").slice(-12).join("\n")}`);
   }
 
-  const filename = options.filename ?? "audio.wav";
-  const outputPath = join(outputDir, filename);
-  const args = buildExtractArgs(videoPath, outputPath, options);
-
-  await execFileAsync("ffmpeg", args);
-  return outputPath;
+  const bytes = ws.readFile(outPath);
+  // MEMFS hands back a view into wasm memory whose offset is not guaranteed to
+  // be 4-byte aligned, so copy before reinterpreting it as floats.
+  const copy = new Uint8Array(bytes.length);
+  copy.set(bytes);
+  return new Float32Array(copy.buffer, 0, Math.floor(copy.length / 4));
 }

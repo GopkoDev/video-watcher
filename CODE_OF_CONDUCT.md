@@ -21,7 +21,7 @@ Examples of unacceptable behavior:
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be reported by contacting the maintainer at [@jordanrendric](https://github.com/jordanrendric). All complaints will be reviewed and investigated promptly and fairly.
+Instances of abusive, harassing, or otherwise unacceptable behavior may be reported by contacting [@GopkoDev](https://github.com/GopkoDev). All complaints will be reviewed and investigated promptly and fairly.
 
 ## Attribution
 

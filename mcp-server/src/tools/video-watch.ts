@@ -1,50 +1,28 @@
 import { z } from "zod";
-import { join } from "path";
-import { homedir } from "os";
-import { copyFileSync, mkdirSync, rmSync } from "fs";
-import { tmpdir } from "os";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { loadConfig } from "../config.js";
+import { loadConfig, SESSIONS_DIR } from "../config.js";
+import { withVideo } from "../ffmpeg/workspace.js";
 import {
-  getVideoMetadata,
-  extractFrames,
   calculateAutoFps,
+  extractFrames,
   extractFramesBySegments,
-  frameFormatExtension,
   frameFormatMimeType,
+  probeVideo,
 } from "../extractors/frames.js";
-import { extractAudio } from "../extractors/audio.js";
-import { analyzeWithGeminiApi } from "../backends/gemini-api.js";
-import { transcribeWithWhisper } from "../backends/local.js";
-import { transcribeWithOpenAI } from "../backends/openai.js";
+import { extractPcm } from "../extractors/audio.js";
+import { emptyAudioResult, transcribe } from "../asr/whisper.js";
+import { resolveWhisperModel } from "../asr/models.js";
 import { parseHMS, shiftAudioResult } from "../utils/timestamps.js";
-import {
-  buildCaptionAudioResult,
-  getCaptionFallbackReason,
-  resolveVideoInputDetailed,
-} from "../utils/video-source.js";
-import { getSessionDir, loadManifest, saveManifest, computeVideoHash } from "../session/manager.js";
+import { resolveVideoPath } from "../utils/video-path.js";
+import { computeVideoHash, getSessionDir, loadManifest, saveManifest } from "../session/manager.js";
 import { createManifest, frameCacheKey, mergeFrames, sampleFrameIndices } from "../session/manifest.js";
-import type { AudioResult, VideoWatchResult, Frame, Segment, SessionManifest } from "../types.js";
-
-const CONFIG_PATH = join(homedir(), ".claude-video-vision", "config.json");
+import { cacheFrames } from "../session/cache.js";
+import type { AudioResult, Frame, Segment, SessionManifest } from "../types.js";
 
 const HMS_REGEX = /^\d{2}:\d{2}:\d{2}$/;
 
-const SESSIONS_DIR = join(homedir(), ".claude-video-vision", "sessions");
-
-const UNCONFIGURED_MESSAGE = `## claude-video-vision is not configured yet!
-
-Please run **/setup-video-vision** to configure the plugin before using it.
-
-Available backends:
-- **Gemini API** — Best quality. Analyzes audio natively. Free tier: 1500 req/day. Requires GEMINI_API_KEY.
-- **Local (Whisper)** — Free, fully offline. Requires whisper.cpp or openai-whisper installed.
-- **OpenAI Whisper API** — Good quality. Requires OPENAI_API_KEY.`;
-
-function timestampToFormattedFilename(timestamp: string, extension: string): string {
-  return `${timestamp.replace(/:/g, "-")}.${extension}`;
-}
+/** Frames per segment are bounded separately — a segment is already narrow. */
+const MAX_FRAMES_PER_SEGMENT = 1000;
 
 export interface DeriveFpsParams {
   fps: number | "auto";
@@ -57,6 +35,7 @@ export interface DeriveFpsParams {
 
 export function deriveFps(params: DeriveFpsParams): number {
   const usingSegments = params.segments && params.segments.length > 0;
+
   if (params.fps === "auto") {
     if (params.view_sample && !usingSegments) {
       const startSec = params.start_time ? parseHMS(params.start_time) : 0;
@@ -66,257 +45,167 @@ export function deriveFps(params: DeriveFpsParams): number {
     }
     return calculateAutoFps(params.duration_seconds);
   }
+
   return params.fps;
 }
 
 export function registerVideoWatch(server: McpServer): void {
   server.tool(
     "video_watch",
-    "Extract frames and process audio from a local video file or YouTube URL. Returns frames (as base64 images or text descriptions) + transcription + audio analysis for Claude to understand the video content. IMPORTANT: For videos longer than 30 seconds, call video_analyze FIRST to get structural data (scene changes, silence, transcription) before calling this tool — use that data to set smart segments with variable FPS. When the video is long enough to trigger audio chunking, the result's `audio.warnings` array (if present) reports chunk-boundary decisions and any per-chunk retries or failures — surface these to the user.",
+    "Extract frames and transcribe audio from a local video file. Returns frames as images plus a timestamped transcript so Claude can see and hear the video. IMPORTANT: for videos longer than 30 seconds call video_analyze FIRST to get structural data (scene changes, silence, transcript), then use it to pick smart segments with variable FPS instead of extracting the whole file.",
     {
-      path: z.string().describe("Absolute/relative path to the video file, or a YouTube URL"),
-      fps: z.union([z.coerce.number().positive(), z.literal("auto")]).default("auto").describe("Frames per second to extract"),
-      resolution: z.coerce.number().min(128).max(2048).optional().describe("Frame width in px (maintains aspect ratio)"),
-      frame_mode: z.enum(["images", "descriptions"]).optional().describe("Return frames as base64 images or text descriptions"),
-      frame_format: z.enum(["jpeg", "png", "webp"]).optional().describe("Frame image format for extraction"),
-      describer_model: z.enum(["opus", "sonnet", "haiku"]).optional().describe("Model for frame-describer agent"),
-      start_time: z.string().regex(HMS_REGEX, "Must be HH:MM:SS format").optional().describe("Start time (e.g. '00:01:30')"),
-      end_time: z.string().regex(HMS_REGEX, "Must be HH:MM:SS format").optional().describe("End time (e.g. '00:05:00')"),
-      skip_audio: z.boolean().default(false).describe("Skip audio extraction and transcription — frames only"),
+      path: z.string().describe("Path to a local video file (~ is expanded)"),
+      fps: z.union([z.coerce.number().positive(), z.literal("auto")]).optional().describe("Frames per second to extract; defaults to the configured value"),
+      resolution: z.coerce.number().min(128).max(2048).optional().describe("Frame width in px (aspect ratio preserved)"),
+      frame_format: z.enum(["jpeg", "png", "webp"]).optional().describe("Frame image format"),
+      start_time: z.string().regex(HMS_REGEX, "Must be HH:MM:SS format").optional().describe("Absolute start time, e.g. '00:01:30'"),
+      end_time: z.string().regex(HMS_REGEX, "Must be HH:MM:SS format").optional().describe("Absolute end time, e.g. '00:05:00'"),
+      language: z.string().optional().describe("ISO-639-1 code for transcription, or 'auto' to detect"),
+      skip_audio: z.boolean().default(false).describe("Frames only — skip transcription"),
       segments: z.array(z.object({
         start: z.string().regex(HMS_REGEX, "Must be HH:MM:SS format"),
         end: z.string().regex(HMS_REGEX, "Must be HH:MM:SS format"),
         fps: z.number().positive(),
         resolution: z.number().min(128).max(2048).optional(),
-      })).optional().describe("Variable FPS/resolution segments — overrides global fps/start_time/end_time"),
+      })).optional().describe("Variable FPS/resolution segments — overrides fps/start_time/end_time for frames"),
       view_sample: z.number().min(1).optional().describe("Return only N evenly spaced frames"),
     },
     async (params) => {
-      const config = loadConfig(CONFIG_PATH);
+      const config = loadConfig();
+      const videoPath = resolveVideoPath(params.path);
+      const resolution = params.resolution ?? config.frame_resolution;
+      const frameFormat = params.frame_format ?? config.frame_format;
+      const maxInputBytes = config.max_input_mb * 1024 * 1024;
 
-      const resolution = params.resolution || config.frame_resolution;
-      const frameMode = params.frame_mode || config.frame_mode;
-      const resolved = await resolveVideoInputDetailed(params.path);
-      const safePath = resolved.path;
-      const frameFormat = params.frame_format || config.frame_format;
-      const frameExtension = frameFormatExtension(frameFormat);
-      const frameMimeType = frameFormatMimeType(frameFormat);
+      // Everything that needs ffmpeg happens in one exclusive scope so the
+      // video is copied into wasm memory only once.
+      const extracted = await withVideo(videoPath, maxInputBytes, (ws) => {
+        const metadata = probeVideo(ws);
 
-      // Session support
-      const useSession = config.enable_index;
-      let sessionDir: string | null = null;
-      let manifest: SessionManifest | null = null;
-
-      if (useSession) {
-        sessionDir = getSessionDir(SESSIONS_DIR, safePath);
-        manifest = loadManifest(sessionDir) ?? createManifest(computeVideoHash(safePath), safePath);
-      }
-
-      // 1. Get metadata
-      const metadata = await getVideoMetadata(safePath);
-      const captionFallbackReason = resolved.source?.type === "youtube"
-        ? getCaptionFallbackReason(resolved.captions, metadata.duration_seconds)
-        : null;
-
-      if (config.backend === "unconfigured" && !params.skip_audio && captionFallbackReason !== null) {
-        return { content: [{ type: "text", text: UNCONFIGURED_MESSAGE }] };
-      }
-
-      // 2. Calculate fps
-      const fps = deriveFps({
-        fps: params.fps,
-        view_sample: params.view_sample,
-        start_time: params.start_time,
-        end_time: params.end_time,
-        segments: params.segments,
-        duration_seconds: metadata.duration_seconds,
-      });
-
-      // 3. Prepare work dir
-      const workDir = join(tmpdir(), `cvv-${Date.now()}`);
-      mkdirSync(workDir, { recursive: true });
-      const framesDir = join(workDir, "frames");
-
-      // 4. Run frame extraction and audio processing
-      //    When segments are provided, frame extraction is sequential (per segment);
-      //    audio can still run in parallel with the entire segment batch.
-
-      let framesPromise: Promise<Frame[]>;
-
-      if (params.segments && params.segments.length > 0) {
-        const extractDir = useSession ? join(sessionDir!, "frames", frameFormat) : join(workDir, "frames");
-        framesPromise = extractFramesBySegments(safePath, params.segments as Segment[], extractDir, frameFormat).then((segmentFrames) => {
-          if (useSession && manifest) {
-            for (const frame of segmentFrames) {
-              if (!frame.sourcePath) continue;
-
-              const res = String(frame.resolution);
-              const cacheKey = frameCacheKey(res, frameFormat);
-              manifest = mergeFrames(manifest!, cacheKey, [
-                { timestamp: frame.timestamp, file: frame.sourcePath },
-              ]);
-            }
-          }
-          return segmentFrames;
+        const fps = deriveFps({
+          fps: params.fps ?? config.default_fps,
+          view_sample: params.view_sample,
+          start_time: params.start_time,
+          end_time: params.end_time,
+          segments: params.segments,
+          duration_seconds: metadata.duration_seconds,
         });
-      } else {
-        framesPromise = extractFrames(safePath, {
-          fps,
-          resolution,
-          outputDir: framesDir,
-          format: frameFormat,
-          startTime: params.start_time,
-          endTime: params.end_time,
-          maxFrames: config.max_frames,
-        }).then((extractedFrames) => {
-          if (useSession && manifest && sessionDir) {
-            const cacheKey = frameCacheKey(resolution, frameFormat);
-            const resDir = join(sessionDir, "frames", frameFormat, String(resolution));
-            mkdirSync(resDir, { recursive: true });
 
-            const manifestEntries: { timestamp: string; file: string }[] = [];
-            for (const frame of extractedFrames) {
-              if (!frame.sourcePath) continue;
+        let frames: Frame[];
+        let truncated = false;
 
-              const filePath = join(resDir, timestampToFormattedFilename(frame.timestamp, frameExtension));
-              copyFileSync(frame.sourcePath, filePath);
-              manifestEntries.push({ timestamp: frame.timestamp, file: filePath });
-            }
-
-            manifest = mergeFrames(manifest, cacheKey, manifestEntries);
-          }
-
-          return extractedFrames;
-        });
-      }
-
-      let audioPromise: Promise<AudioResult>;
-
-      if (params.skip_audio || !metadata.has_audio) {
-        audioPromise = Promise.resolve({ backend: "none" as const, transcription: [], audio_tags: [], full_analysis: null });
-      } else if (captionFallbackReason === null && resolved.captions) {
-        audioPromise = Promise.resolve(
-          buildCaptionAudioResult(resolved.captions, {
+        if (params.segments && params.segments.length > 0) {
+          frames = extractFramesBySegments(
+            ws,
+            params.segments as Segment[],
+            frameFormat,
+            resolution,
+            MAX_FRAMES_PER_SEGMENT,
+          );
+        } else {
+          const result = extractFrames(ws, {
+            fps,
+            resolution,
+            format: frameFormat,
             startTime: params.start_time,
             endTime: params.end_time,
-          }),
-        );
-      } else if (config.backend === "gemini-api") {
-        audioPromise = analyzeWithGeminiApi(safePath, config, {
-          startTime: params.start_time,
-          endTime: params.end_time,
-        });
-      } else if (config.backend === "openai") {
-        const audioDir = join(workDir, "audio");
-        audioPromise = extractAudio(safePath, audioDir, {
-          startTime: params.start_time,
-          endTime: params.end_time,
-        }).then((wavPath) => transcribeWithOpenAI(wavPath));
+            maxFrames: config.max_frames,
+          });
+          frames = result.frames;
+          truncated = result.truncated;
+        }
+
+        const pcm = !params.skip_audio && metadata.has_audio
+          ? extractPcm(ws, { startTime: params.start_time, endTime: params.end_time })
+          : null;
+
+        return { metadata, fps, frames, truncated, pcm };
+      });
+
+      const { metadata, fps, truncated, pcm } = extracted;
+      let frames = extracted.frames;
+
+      // Transcription runs outside the ffmpeg lock — it is the slow part and
+      // needs no ffmpeg.
+      let audio: AudioResult;
+      if (params.skip_audio) {
+        audio = emptyAudioResult("skip_audio was set");
+      } else if (!metadata.has_audio) {
+        audio = emptyAudioResult("video has no audio track");
       } else {
-        // local
-        const audioDir = join(workDir, "audio");
-        const modelDir = join(homedir(), ".claude-video-vision", "models");
-        audioPromise = extractAudio(safePath, audioDir, {
-          startTime: params.start_time,
-          endTime: params.end_time,
-        }).then((wavPath) =>
-          transcribeWithWhisper(wavPath, {
-            engine: config.whisper_engine,
-            model: config.whisper_model,
-            whisperAt: config.whisper_at,
-            modelDir,
-          }),
-        );
+        const spec = resolveWhisperModel(config.whisper_model);
+        const raw = await transcribe(pcm!, {
+          spec,
+          language: params.language ?? config.whisper_language,
+        });
+        // Backends time the transcript from the start of the extracted audio;
+        // frames already carry absolute timestamps.
+        audio = shiftAudioResult(raw, params.start_time ? parseHMS(params.start_time) : 0);
       }
 
-      let [frames, rawAudio] = await Promise.all([framesPromise, audioPromise]);
+      // Session cache
+      let manifest: SessionManifest | null = null;
+      if (config.enable_index) {
+        const sessionDir = getSessionDir(SESSIONS_DIR, videoPath);
+        manifest = loadManifest(sessionDir) ?? createManifest(computeVideoHash(videoPath), videoPath);
 
-      if (captionFallbackReason !== null && rawAudio.backend !== "youtube-captions" && rawAudio.backend !== "none") {
-        rawAudio = { ...rawAudio, transcription_fallback_reason: captionFallbackReason };
-      }
+        const byResolution = new Map<number, Frame[]>();
+        for (const frame of frames) {
+          const res = (frame as { resolution?: number }).resolution ?? resolution;
+          byResolution.set(res, [...(byResolution.get(res) ?? []), frame]);
+        }
 
-      // 5. Align audio timestamps with the original video timeline.
-      //    Backends return timestamps relative to the cropped audio, but frames
-      //    already carry original-video timestamps via extractFrames. Shift the
-      //    audio result so both timelines match.
-      const offsetSeconds = params.start_time ? parseHMS(params.start_time) : 0;
-      const audio = shiftAudioResult(rawAudio, offsetSeconds);
+        for (const [res, group] of byResolution) {
+          const entries = cacheFrames(sessionDir, frameFormat, res, group);
+          manifest = mergeFrames(manifest, frameCacheKey(res, frameFormat), entries);
+        }
 
-      // 6. Apply view_sample filtering — return only N evenly spaced frames
-      if (params.view_sample && frames.length > params.view_sample) {
-        const indices = sampleFrameIndices(frames.length, params.view_sample);
-        frames = indices.map((i) => frames[i]);
-      }
-
-      // 7. Persist session manifest
-      if (useSession && manifest && sessionDir) {
         saveManifest(sessionDir, manifest);
       }
 
-      // 8. Build result
-      const result: VideoWatchResult = { metadata, frames, audio };
-
-      // 9. Cleanup temp dir (only when not using session — session dir is persistent)
-      if (!useSession) {
-        rmSync(workDir, { recursive: true, force: true });
+      if (params.view_sample && frames.length > params.view_sample) {
+        frames = sampleFrameIndices(frames.length, params.view_sample).map((i) => frames[i]);
       }
 
-      // 10. Return as MCP content
-      const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [];
+      // ---- MCP content ----
+      const content: Array<
+        | { type: "text"; text: string }
+        | { type: "image"; data: string; mimeType: string }
+      > = [];
 
-      if (resolved.source) {
-        content.push({ type: "text", text: `## Source\n${JSON.stringify(resolved.source, null, 2)}` });
-      }
-
-      // Manifest summary (only when session is active)
       if (manifest) {
-        const manifestSummary = {
+        const summary = {
           video_hash: manifest.video_hash,
           resolutions: Object.fromEntries(
-            Object.entries(manifest.resolutions).map(([res, data]) => [
-              res, { frame_count: data.frames.length, timestamps: data.frames.map((f) => f.timestamp) },
+            Object.entries(manifest.resolutions).map(([key, data]) => [
+              key,
+              { frame_count: data.frames.length, timestamps: data.frames.map((f) => f.timestamp) },
             ]),
           ),
         };
-        content.push({ type: "text", text: `## Session Manifest\n${JSON.stringify(manifestSummary, null, 2)}` });
+        content.push({ type: "text", text: `## Session Manifest\n${JSON.stringify(summary, null, 2)}` });
       }
 
-      // Metadata + audio as text
-      content.push({
-        type: "text",
-        text: `## Video Metadata\n${JSON.stringify(metadata, null, 2)}\n\n## Audio Analysis\n${JSON.stringify(audio, null, 2)}`,
-      });
-
-      // Frames
-      if (frameMode === "images") {
-        for (const frame of frames) {
-          content.push({
-            type: "text",
-            text: `### Frame at ${frame.timestamp}`,
-          });
-          if (frame.image) {
-            content.push({
-              type: "image",
-              data: frame.image,
-              mimeType: frameMimeType,
-            });
-          }
-        }
-      } else {
-        // descriptions mode — return frame data for the frame-describer agent to process
+      if (truncated) {
         content.push({
           type: "text",
-          text: `## Frames (${frames.length} extracted at ${fps} fps)\nFrame mode is "descriptions" — use the frame-describer agent to generate text descriptions of these frames.\n\n${frames.map((f) => `- ${f.timestamp}`).join("\n")}`,
+          text:
+            `## Warning\nExtraction stopped at max_frames (${config.max_frames}), so the frames below cover only ` +
+            `the first ${(config.max_frames / fps).toFixed(0)}s of the requested range. Lower the fps, narrow the ` +
+            `range, or raise max_frames with video_configure.`,
         });
-        // Still include images so the agent can describe them
-        for (const frame of frames) {
-          if (frame.image) {
-            content.push({
-              type: "image",
-              data: frame.image,
-              mimeType: frameMimeType,
-            });
-          }
+      }
+
+      content.push({
+        type: "text",
+        text: `## Video Metadata\n${JSON.stringify(metadata, null, 2)}\n\n## Audio\n${JSON.stringify(audio, null, 2)}`,
+      });
+
+      const mimeType = frameFormatMimeType(frameFormat);
+      for (const frame of frames) {
+        content.push({ type: "text", text: `### Frame at ${frame.timestamp}` });
+        if (frame.image) {
+          content.push({ type: "image", data: frame.image, mimeType });
         }
       }
 

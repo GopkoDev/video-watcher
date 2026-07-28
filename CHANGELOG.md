@@ -4,6 +4,64 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-07-28
+
+### Added
+
+- **Lazy file access** — ffmpeg now reads the source video off disk in chunks instead of receiving a full copy in wasm memory. Emscripten's WORKERFS supports this but expects the browser-only `FileReaderSync`; the plugin supplies a Node implementation backed by `fs.readSync`.
+
+  Measured on a 568 MB / 69-minute 1080p file (5 frames from minute 10 plus 10s of audio): peak RSS **+183 MB instead of +1344 MB**, and 1087 ms instead of 1509 ms, with byte-identical output.
+
+  Consequences: video size is no longer a practical limit, and memory no longer scales with it. `max_input_mb` still exists but now only guards the fallback path.
+
+- **`CVV_DISABLE_LAZY_INPUT=1`** forces the previous in-memory behaviour, for the case where a future `@ffmpeg/core` release changes the internals this relies on. The plugin also falls back on its own, with a note on stderr, if the mount cannot be established.
+
+- **`medium`, `large-v3-turbo` and `large-v3` whisper models.** The registry was capped at `small` on the reasoning that wasm cannot run anything bigger — but only ffmpeg is WebAssembly, while transcription runs on `onnxruntime-node`, which is native. Model size is therefore unconstrained; the only costs are download, disk and time.
+
+### Changed
+
+- **`whisper_model: "auto"` now picks `large-v3-turbo` at 16GB of RAM and above** (`tiny` below 8GB, `small` below 16GB) — the accuracy tier the 1.x plugin used, at a fraction of its cost. This supersedes the `tiny` / `base` / `small` split introduced in 2.0.0.
+- **Renamed to VideoWatcher.** The plugin is `video-watcher`, the npm package is `@gopkodev/video-watcher`, and the repository moved to [GopkoDev/video-watcher](https://github.com/GopkoDev/video-watcher). Reinstall with `/plugin install video-watcher@gopko-dev` — the old plugin name will not resolve.
+- **Approximate download sizes corrected** in `video_setup` and the docs: `tiny` 39MB, `base` 174MB, `small` 238MB. The previous numbers (45 / 85 / 260) were wrong for the published q8 weights.
+
+### Fixed
+
+- **`base` no longer fails on first use.** The registry pointed at `onnx-community/whisper-base`, which does not exist, so every 8–16GB machine — where `auto` selected `base` in 2.0.0 — would have failed on its first transcription. The published repository is `onnx-community/whisper-base-ONNX`.
+- **The npm package now ships a README and a LICENSE.** `files` listed both, but they live in the repository root rather than in `mcp-server/`, so the published tarball would have contained neither; `prepack` copies them in and `postpack` removes them again. A scoped package also defaults to restricted access, which would have failed the first publish — `publishConfig.access` is now `public`.
+
+## [2.0.0] - 2026-07-28
+
+Rewrite around a single, dependency-free local backend. The plugin now runs entirely inside the Node process: no system binary has to be installed, and the only network call is a one-time whisper model download.
+
+### Added
+
+- **ffmpeg as WebAssembly** — frame extraction, audio decoding and all analysis filters now run through `@ffmpeg/core` in-process. Nothing to install, identical behaviour on every platform.
+- **Local whisper via transformers.js** — `@huggingface/transformers` replaces whisper.cpp and the Python CLI. Models are cached in `~/.claude-video-vision/models/` and reused offline.
+- **Automatic model selection** — whisper size is derived from installed RAM (`tiny` < 8GB, `base` < 16GB, `small` otherwise) and can still be pinned with `video_configure`.
+- **Automatic language detection** — the spoken language is read from whisper's own first decoder step instead of silently defaulting to English. Reported as `language` / `language_detected` in the result.
+- **`max_input_mb` guard** — videos too large for wasm memory are refused with an actionable message instead of crashing the server.
+- **`max_frames` truncation warning** — `video_watch` now says so when the frame cap cut the requested range short, rather than silently returning partial coverage.
+- **`~` expansion** in every `path` parameter.
+- **`video_setup` prefetch** — loads ffmpeg and downloads the model up front.
+
+### Removed
+
+- **Gemini API and OpenAI backends**, along with `GEMINI_API_KEY` / `OPENAI_API_KEY` handling and the `backend` setting. There is one backend now, and it is local.
+- **YouTube URL support** (`yt-dlp` download, subtitle/auto-caption extraction, the downloads cache). Only local files are accepted.
+- **Audio chunking** (`audio_chunk_*` settings) — it only ever applied to the Gemini backend.
+- **`frame_mode: "descriptions"` and the `frame-describer` agent** — the agent was never registered by the plugin manifest, and the mode returned every image anyway, so it saved nothing.
+- **`whisper_engine`, `whisper_at`, `audio_tags`** — the Python engine parsed the wrong stream and produced a single unusable segment; audio tagging never worked as a result.
+- **`ffprobe`** — the shared wasm instance permanently breaks `exec()` once `ffprobe()` has run on it, so metadata is parsed from `ffmpeg -i` output instead.
+
+### Fixed
+
+- **`end_time` is now absolute for frames.** With `-ss` before `-i`, ffmpeg measured `-to` from the seek point, so `start_time: 00:00:05, end_time: 00:00:10` extracted ten seconds of frames while the audio covered five. Both paths now emit an explicit `-t (end − start)`.
+- **Session frames no longer overwrite each other.** `video_watch` wrote ffmpeg's sequential `frame_0001…` names straight into the session cache, so a later call with a different range silently replaced cached frames the manifest still pointed at. Frames are now always stored under timestamp-derived names.
+- **Temporary files no longer leak** when `enable_index` is on — there are no scratch files on disk at all now.
+- **A corrupt `config.json` no longer breaks every tool** — it falls back to defaults and reports the problem on stderr.
+- **`default_fps` is honoured.** It was declared, documented and never read.
+- **`metadata.duration` includes hours** — it previously rendered 1h15m as `75:30`.
+
 ## [1.2.1] - 2026-04-26
 
 ### Fixed

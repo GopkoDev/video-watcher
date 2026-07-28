@@ -22,3 +22,12 @@ config.json
 *.jpg
 *.png
 !mcp-server/tests/fixtures/*
+!assets/*
+
+# copied in by prepack, removed by postpack — anchored so the repository's
+# own README and LICENSE are unaffected
+/mcp-server/README.md
+/mcp-server/LICENSE
+
+# local working document, not part of the distributed plugin
+docs/SPEC-local-backend.md

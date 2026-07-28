@@ -1,15 +1,15 @@
 {
-  "name": "claude-video-vision",
-  "description": "Give Claude the ability to watch and understand videos — extracts frames and audio for full video perception",
-  "version": "1.2.0",
+  "name": "video-watcher",
+  "description": "Give Claude the ability to watch local videos — extracts frames and transcribes audio entirely inside Node, with no external binaries",
+  "version": "2.1.0",
   "author": {
-    "name": "Jordan Vasconcelos",
-    "url": "https://github.com/jordanrendric"
+    "name": "Dmytro Hopko",
+    "url": "https://github.com/GopkoDev"
   },
-  "homepage": "https://github.com/jordanrendric/claude-video-vision",
-  "repository": "https://github.com/jordanrendric/claude-video-vision",
+  "homepage": "https://github.com/GopkoDev/video-watcher",
+  "repository": "https://github.com/GopkoDev/video-watcher",
   "license": "MIT",
-  "keywords": ["video", "vision", "multimodal", "ffmpeg", "whisper", "gemini", "perception"],
+  "keywords": ["video", "vision", "multimodal", "ffmpeg", "whisper", "offline", "perception"],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json"
 }
